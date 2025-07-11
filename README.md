@@ -14,12 +14,23 @@ It's Cookie Clicker clone made in LUA using Lua Player Plus SDL based off Cookie
 * Press X/X controller button to click Cookie
 * And also UPGRADES
 ## Controls
-* <kbd>Space</kbd> - screen Buttons
-* <kbd>Square</kbd> - Expand/ Shrink Upgrade menu
-* <kbd>Left Stick</kbd> - move Buildings
-* <kbd>Right Stick</kbd> - move Buttons
-* <kbd>Triangle</kbd> - Touch Cookie
-* <kbd>Select</kbd> - Save and Exit
+
+### Keyboard
+* <kbd>Enter</kbd> - Select/Confirm/Action buttons
+* <kbd>X</kbd> - Click cookie
+* <kbd>Tab</kbd> - Switch between Buildings and Store panels
+* <kbd>Up/Down Arrows</kbd> - Navigate items
+* <kbd>Left/Right Arrows</kbd> - Navigate horizontally/change quantity
+* <kbd>Y</kbd> - Purchase upgrades for selected building
+* <kbd>Backspace</kbd> - Return to menu/previous screen
+
+### Gamepad (SDL Controller)
+* <kbd>A Button</kbd> - Select/Confirm/Action buttons
+* <kbd>X Button</kbd> - Click cookie
+* <kbd>B Button</kbd> - Switch between Buildings and Store panels
+* <kbd>D-Pad Up/Down</kbd> - Navigate items
+* <kbd>D-Pad Left/Right</kbd> - Navigate horizontally/change quantity
+* <kbd>Y Button</kbd> - Purchase upgrades for selected building
+* <kbd>Start Button</kbd> - Return to menu/previous screen
 ## Credits
 * [Rinnegatamante](https://github.com/Rinnegatamante/) - [lpp-vita](https://github.com/Rinnegatamante/lpp-vita)
-* [xerpi](https://github.com/xerpi/) - [libvita2d](https://github.com/xerpi/libvita2d)

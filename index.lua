@@ -2108,7 +2108,7 @@ function drawControlsScreen()
     
     -- Combined controls showing keyboard/gamepad for each action
     local controls = {
-        {"SPACE/A Button", "Enter/Action"},
+        {"ENTER/A Button", "Enter/Action"},
         {"X/X Button", "Click Cookie"},
         {"TAB/B Button", "Switch Panel (Buildings/Store)"},
         {"UP/DOWN/D-Pad UP/DOWN", "Navigate Items"},
