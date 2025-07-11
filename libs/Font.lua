@@ -47,7 +47,7 @@ g_init(' ',580,581)
 g_init(':',555,561)
 g_init('-',569,580)
 g_init('#',582,599)
-font_png = Graphics.loadImage(MODE.."/libs/font.png")
+font_png = Graphics.loadImage(MODE.."libs/font.png")
 Center={}
 function gpu_drawtext(x, y, text, font_color)
     local text_u = string.upper(text) --my font system is caps-only.
