@@ -1,21 +1,20 @@
 ![](/logo.png)
-# CookieClicker Vita
-It's Cookie Clicker clone made on LUA for PlayStation Vita<br>
+# CookieClicker SDL
+It's Cookie Clicker clone made in LUA using Lua Player Plus SDL based off CookieClicker Vita by  Creckeryop<br>
 ![GitHub All Releases](https://img.shields.io/github/downloads/christopher-roelofs/CookieClicker-SDL/total?style=flat-square)
-![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/Creckeryop/CookieClicker-Vita?include_prereleases&style=flat-square)
-![](/screenshot.jpg)
+![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/christopher-roelofs/CookieClicker-SDL?include_prereleases&style=flat-square)
+![](/screenshot.png)
 ## Features
-* Long Numbers (thanks to lpp-vita)
 * Buildings until Prism
-* Design more looks like a browser version
+* Two panel layout to work on smaller screen resolutions
 * Buy and Sell Buildings, (1/10/100)pcs
-* Save Loading(save file is in the ux0:/data/ folder called ccsave.sav, ccupsave.sav)
-* You can use Sensor or Left/Right analog to move Buildings or Buttons
-* Press triangle to click Cookie or touch it
-* Touch Buy Sell to change mode
+* Save Loading(save file is in the root of folder called ccsave.sav, ccupsave.sav)
+* Toggle between buildings panel and store
+* Toggle buy/sell modes
+* Press X/X controller button to click Cookie
 * And also UPGRADES
 ## Controls
-* <kbd>TouchScreen</kbd> - screen Buttons
+* <kbd>Space</kbd> - screen Buttons
 * <kbd>Square</kbd> - Expand/ Shrink Upgrade menu
 * <kbd>Left Stick</kbd> - move Buildings
 * <kbd>Right Stick</kbd> - move Buttons
