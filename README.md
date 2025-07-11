@@ -34,3 +34,4 @@ It's Cookie Clicker clone made in LUA using Lua Player Plus SDL based off Cookie
 * <kbd>Start Button</kbd> - Return to menu/previous screen
 ## Credits
 * [Rinnegatamante](https://github.com/Rinnegatamante/) - [lpp-vita](https://github.com/Rinnegatamante/lpp-vita)
+* [Creckeryop](https://github.com/Creckeryop) - [CookieClicker Vita](https://github.com/Creckeryop/CookieClicker-Vita)
