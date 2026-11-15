@@ -149,6 +149,8 @@ Game.totalUpgrades = 0
 local AudioSettings = {
     bgMusicEnabled = true,
     bgMusicVolume = 0.7,  -- 0.0 to 1.0
+    sfxEnabled = true,
+    sfxVolume = 0.8,      -- 0.0 to 1.0
     isPlaying = false
 }
 
@@ -167,8 +169,9 @@ local ControlSettings = {
 -- Settings navigation
 local SettingsState = {
     selectedIndex = 1,
-    options = {"Background Music", "Music Volume", "Cookie Shower", "Milk Animation", "Reset Game"},
-    optionCount = 5
+    options = {"Background Music", "Music Volume", "Sound Effects", "Effects Volume",
+               "Cookie Shower", "Milk Animation", "Reset Game"},
+    optionCount = 7
 }
 
 -- SDL Control state (simplified for 2-panel layout)
@@ -253,6 +256,8 @@ local timer = Timer.new()
 local navTimer = Timer.new()
 local buttonTimer = Timer.new()
 local cookieTimer = Timer.new()
+local autosaveTimer = Timer.new()
+local AUTOSAVE_DELAY = 30000  -- milliseconds between autosaves while playing
 local NAV_DELAY = 150  -- milliseconds between navigation inputs
 local BUTTON_DELAY = 100  -- milliseconds between button presses
 local COOKIE_DELAY = 50   -- milliseconds between cookie clicks (faster for better feel)
@@ -311,6 +316,36 @@ Sound.init()
 local bgMusic = nil
 if System.doesFileExist(assetPath.."bgm.ogg") then
     bgMusic = Sound.open(assetPath.."bgm.ogg")
+end
+
+-- Sound effects (made by tools/make_sfx.py)
+local Sfx = {}
+for _, name in ipairs({"click1", "click2", "click3", "buy", "sell", "upgrade", "denied",
+                       "nav", "select", "back"}) do
+    local path = assetPath.."sfx_"..name..".wav"
+    if System.doesFileExist(path) then
+        Sfx[name] = Sound.open(path)
+    end
+end
+local clickVariant = 0
+
+function playSfx(name)
+    if not AudioSettings.sfxEnabled then return end
+    -- Rotate through the click variants so fast clicking overlaps instead of cutting off
+    if name == "click" then
+        clickVariant = clickVariant % 3 + 1
+        name = "click" .. clickVariant
+    end
+    if Sfx[name] then
+        Sound.play(Sfx[name], false)
+    end
+end
+
+function updateSfxVolume()
+    local volume = math.floor(AudioSettings.sfxVolume * 32767)
+    for _, sound in pairs(Sfx) do
+        Sound.setVolume(sound, volume)
+    end
 end
 
 -- Store textures in table for easy access
@@ -402,10 +437,15 @@ local smallFont = Font.load()
 local titleFont = Font.load()
 
 -- Set font sizes
+-- Sizes follow the screen (16/12/32 px at 640x480), with a floor so text
+-- stays legible on small screens
+local FONT_SIZE = math.max(11, math.floor(16 * scale + 0.5))
+local SMALL_FONT_SIZE = math.max(9, math.floor(12 * scale + 0.5))
+local TITLE_FONT_SIZE = math.max(20, math.floor(32 * scale + 0.5))
 if Font.setPixelSizes then
-    Font.setPixelSizes(titleFont, 32)  -- Large font for title
-    Font.setPixelSizes(defaultFont, 16)  -- Normal font size
-    Font.setPixelSizes(smallFont, 12)  -- Small font for prices
+    Font.setPixelSizes(titleFont, TITLE_FONT_SIZE)
+    Font.setPixelSizes(defaultFont, FONT_SIZE)
+    Font.setPixelSizes(smallFont, SMALL_FONT_SIZE)
 end
 
 -- Use default LPP-SDL fonts instead of PNG fonts
@@ -423,58 +463,119 @@ function drawTitleText(x, y, text, color)
     Font.print(titleFont, x, y, text, color)
 end
 
+-- UI colours
+local gold = Color.new(255, 210, 90)
+local grey = Color.new(170, 170, 170)
+local menuIdle = Color.new(185, 205, 220)
+local selectBar = Color.new(0, 0, 0, 110)
+
+-- Smooth scroll positions for the two lists
+BuildingView = { scroll = 0 }
+StoreView = { scroll = 0 }
+
+function textWidth(font, text)
+    if Font.getTextWidth then
+        return Font.getTextWidth(font, text)
+    end
+    return string.len(text) * 8
+end
+
+function drawCentered(font, y, text, color)
+    Font.print(font, math.floor((screenW - textWidth(font, text)) / 2), y, text, color)
+end
+
+-- Outline a rectangle with a border of the given thickness
+function drawFrame(x, y, w, h, t, color)
+    Graphics.fillRect(x, x + w, y, y + t, color)
+    Graphics.fillRect(x, x + w, y + h - t, y + h, color)
+    Graphics.fillRect(x, x + t, y, y + h, color)
+    Graphics.fillRect(x + w - t, x + w, y, y + h, color)
+end
+
+-- Button hints along the bottom of the screen: {{"A", "Select"}, {"B", "Back"}}
+function drawHints(hints)
+    local gap = math.floor(18 * scaleX)
+    local parts = {}
+    local total = 0
+    for i, hint in ipairs(hints) do
+        local keyW = textWidth(smallFont, hint[1])
+        local labelW = textWidth(smallFont, hint[2])
+        parts[i] = {keyW, labelW}
+        total = total + keyW + 6 + labelW + (i > 1 and gap or 0)
+    end
+    local x = math.floor((screenW - total) / 2)
+    local y = screenH - math.floor(22 * scaleY)
+    for i, hint in ipairs(hints) do
+        if i > 1 then x = x + gap end
+        drawSmallText(x, y, hint[1], gold)
+        x = x + parts[i][1] + 6
+        drawSmallText(x, y, hint[2], white)
+        x = x + parts[i][2]
+    end
+end
+
+-- Centred vertical menu with a bar behind the selected entry
+function drawMenuList(state, top, spacing)
+    local widest = 0
+    for i = 1, state.optionCount do
+        widest = math.max(widest, textWidth(defaultFont, state.options[i]))
+    end
+    local barHalf = math.floor(widest / 2) + math.floor(24 * scaleX)
+    for i = 1, state.optionCount do
+        local option = state.options[i]
+        local y = top + (i - 1) * spacing
+        if i == state.selectedIndex then
+            Graphics.fillRect(screenW/2 - barHalf, screenW/2 + barHalf, y - 3, y + spacing - 5, selectBar)
+            drawCentered(defaultFont, y, option, white)
+        else
+            drawCentered(defaultFont, y, option, menuIdle)
+        end
+    end
+end
+
 -- Number formatting for cookie counts (whole numbers, no abbreviations)
-function formatCookieCount(num)
-    num = math.floor(num)  -- Always use whole numbers for cookie count
-    
-    if num >= 1000000000000000000000 then
-        local index = math.min(math.floor(math.log10(num)/3) - 5, #NAMEOMBTQ)
-        return string.format("%.0f %s", num / (10^(index*3+15)), NAMEOMBTQ[index] or "???")
-    elseif num >= 1000000000 then
-        return string.format("%.0f B", num/1000000000)
-    elseif num >= 1000000 then
-        return string.format("%.0f M", num/1000000)
+-- Short-scale number with 3 significant digits: 1.17 T, 16.4 Qa, 199 Sx
+local SHORT_SUFFIX = {"K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No",
+                      "Dc", "Ud", "Dd", "Td", "Qad", "Qid", "Sxd", "Spd", "Ocd", "Nod", "Vg"}
+function shortNumber(num)
+    if num < 1000 then
+        return string.format("%d", math.floor(num))
+    end
+    local tier = math.min(math.floor(math.log10(num) / 3), #SHORT_SUFFIX)
+    local scaled = num / 10 ^ (tier * 3)
+    local text
+    if scaled >= 100 then
+        text = string.format("%d", math.floor(scaled))
+    elseif scaled >= 10 then
+        text = string.format("%.1f", math.floor(scaled * 10) / 10)
     else
+        text = string.format("%.2f", math.floor(scaled * 100) / 100)
+    end
+    if text:find("%.") then
+        text = text:gsub("0+$", ""):gsub("%.$", "")
+    end
+    return text .. " " .. SHORT_SUFFIX[tier]
+end
+
+function formatCookieCount(num)
+    num = math.floor(num)
+    if num < 1000000 then
         return string.format("%d", num)
     end
+    return shortNumber(num)
 end
 
 -- Number formatting function for CPS (keeps decimal precision)
 function formatCPS(num)
-    -- Keep decimal precision for CPS display
-    if num >= 1000000000000000000000 then
-        local index = math.min(math.floor(math.log10(num)/3) - 5, #NAMEOMBTQ)
-        local scaled = num / (10^(index*3+15))
-        return string.format("%.1f %s", scaled, NAMEOMBTQ[index] or "???")
-    elseif num >= 1000000 then
-        local scaled = num/1000000
-        return string.format("%.1f M", scaled)
-    elseif num >= 1000 then
-        local scaled = num/1000
-        return string.format("%.1f K", scaled)
-    else
+    if num < 1000 then
         return string.format("%.1f", num)
     end
+    return shortNumber(num)
 end
 
 -- Number formatting function for other values (prices, etc.)
 function formatNumber(num)
-    -- Round up to nearest integer first
-    num = math.ceil(num)
-    
-    if num >= 1000000000000000000000 then
-        local index = math.min(math.floor(math.log10(num)/3) - 5, #NAMEOMBTQ)
-        local scaled = math.ceil(num / (10^(index*3+15)))
-        return string.format("%d %s", scaled, NAMEOMBTQ[index] or "???")
-    elseif num >= 1000000 then
-        local scaled = math.ceil(num/1000000)
-        return string.format("%d M", scaled)
-    elseif num >= 1000 then
-        local scaled = math.ceil(num/1000)
-        return string.format("%d K", scaled)
-    else
-        return string.format("%d", num)
-    end
+    return shortNumber(math.ceil(num))
 end
 
 -- Time formatting function (converts seconds to readable format)
@@ -646,6 +747,10 @@ function saveGame()
     
     -- Save control settings
     table.insert(saveData, tostring(ControlSettings.gamepadEnabled and 1 or 0))
+
+    -- Save sound effect settings
+    table.insert(saveData, tostring(AudioSettings.sfxEnabled and 1 or 0))
+    table.insert(saveData, tostring(AudioSettings.sfxVolume))
     
     -- Join with # delimiter like Vita version
     local saveString = table.concat(saveData, "#")
@@ -762,6 +867,10 @@ function loadGame()
                 ControlSettings.mode = ControlSettings.gamepadEnabled and "Gamepad" or "Keyboard"
                 index = index + 1 
             end
+
+            -- Load sound effect settings (if available)
+            if saveData[index] then AudioSettings.sfxEnabled = (tonumber(saveData[index]) or 1) == 1; index = index + 1 end
+            if saveData[index] then AudioSettings.sfxVolume = tonumber(saveData[index]) or 0.8; index = index + 1 end
             
             print("Game loaded!")
             return true
@@ -809,6 +918,9 @@ function resetGame()
     -- Reset audio and visual settings to defaults
     AudioSettings.bgMusicEnabled = true
     AudioSettings.bgMusicVolume = 0.7
+    AudioSettings.sfxEnabled = true
+    AudioSettings.sfxVolume = 0.8
+    updateSfxVolume()
     AudioSettings.isPlaying = false
     VisualSettings.cookieShowerEnabled = true
     VisualSettings.milkAnimationEnabled = true
@@ -860,490 +972,465 @@ Upgrade.make("Temple",  3,   25,   10000000000,   8,  3)
 Upgrade.make("Temple",  4,   50,   1000000000000, 8,  4)
 
 -- SDL Input handling
+--
+-- Every action reads the keyboard, the gamepad and the left stick together.
+-- Input.update runs once per frame and works out pressed/repeat for every
+-- action, so asking about the same action twice in a frame is safe.
+local Input = {
+    held = {}, prev = {}, rep = {}, nextRepeat = {}, blocked = {},
+    clock = Timer.new(),
+    REPEAT_DELAY = 350,  -- ms before a held direction starts repeating
+    REPEAT_RATE = 90,    -- ms between repeats
+    now = 0
+}
 
--- Gamepad input helper functions for edge detection
-function checkGamepadButtonPressed(button)
-    if not Controls.checkGamepadButton then
-        return false
+local ACTIONS = {
+    up      = { keys = {SDLK_UP},        buttons = {SDL_CONTROLLER_BUTTON_DPAD_UP},    stick = "up" },
+    down    = { keys = {SDLK_DOWN},      buttons = {SDL_CONTROLLER_BUTTON_DPAD_DOWN},  stick = "down" },
+    left    = { keys = {SDLK_LEFT},      buttons = {SDL_CONTROLLER_BUTTON_DPAD_LEFT},  stick = "left" },
+    right   = { keys = {SDLK_RIGHT},     buttons = {SDL_CONTROLLER_BUTTON_DPAD_RIGHT}, stick = "right" },
+    confirm = { keys = {SDLK_RETURN, SDLK_SPACE}, buttons = {SDL_CONTROLLER_BUTTON_A} },
+    back    = { keys = {SDLK_BACKSPACE}, buttons = {SDL_CONTROLLER_BUTTON_B} },
+    pause   = { keys = {SDLK_BACKSPACE}, buttons = {SDL_CONTROLLER_BUTTON_START} },
+    click   = { keys = {SDLK_X},         buttons = {SDL_CONTROLLER_BUTTON_B} },
+    upgrade = { keys = {SDLK_Y},         buttons = {SDL_CONTROLLER_BUTTON_Y} },
+    mode    = { keys = {SDLK_T},         buttons = {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER} },
+    quit    = { keys = {SDLK_ESCAPE} }
+}
+
+function Input.update(pad)
+    local now = Timer.getTime(Input.clock)
+    Input.now = now
+
+    -- Left stick as a d-pad (Vita range 0..255, centre 128)
+    local stick = {}
+    if Controls.readLeftAnalog then
+        local sx, sy = Controls.readLeftAnalog()
+        sx, sy = sx or 128, sy or 128
+        stick.up, stick.down = sy < 64, sy > 192
+        stick.left, stick.right = sx < 64, sx > 192
     end
-    
-    local current = Controls.checkGamepadButton(button)
-    local wasPressed = false
-    
-    if button == SDL_CONTROLLER_BUTTON_A then
-        wasPressed = current and not gamepadState.A_prev
-        gamepadState.A_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_X then
-        wasPressed = current and not gamepadState.X_prev
-        gamepadState.X_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_B then
-        wasPressed = current and not gamepadState.B_prev
-        gamepadState.B_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_Y then
-        wasPressed = current and not gamepadState.Y_prev
-        gamepadState.Y_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER then
-        wasPressed = current and not gamepadState.L_prev
-        gamepadState.L_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER then
-        wasPressed = current and not gamepadState.R_prev
-        gamepadState.R_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_START then
-        wasPressed = current and not gamepadState.Start_prev
-        gamepadState.Start_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_DPAD_UP then
-        wasPressed = current and not gamepadState.DPadUp_prev
-        gamepadState.DPadUp_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_DPAD_DOWN then
-        wasPressed = current and not gamepadState.DPadDown_prev
-        gamepadState.DPadDown_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_DPAD_LEFT then
-        wasPressed = current and not gamepadState.DPadLeft_prev
-        gamepadState.DPadLeft_prev = current
-    elseif button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT then
-        wasPressed = current and not gamepadState.DPadRight_prev
-        gamepadState.DPadRight_prev = current
+
+    for name, action in pairs(ACTIONS) do
+        local down = false
+        for _, key in ipairs(action.keys or {}) do
+            if Controls.check(pad, key) then down = true end
+        end
+        if not down and Controls.checkGamepadButton then
+            for _, button in ipairs(action.buttons or {}) do
+                if Controls.checkGamepadButton(button) then down = true end
+            end
+        end
+        if not down and action.stick then
+            down = stick[action.stick] or false
+        end
+
+        -- A button held across a screen change stays ignored until released
+        if Input.blocked[name] then
+            if down then down = false else Input.blocked[name] = nil end
+        end
+
+        Input.prev[name] = Input.held[name] or false
+        Input.held[name] = down
+        Input.rep[name] = false
+        if down and not Input.prev[name] then
+            Input.rep[name] = true
+            Input.nextRepeat[name] = now + Input.REPEAT_DELAY
+        elseif down and now >= (Input.nextRepeat[name] or 0) then
+            Input.rep[name] = true
+            Input.nextRepeat[name] = now + Input.REPEAT_RATE
+        end
     end
-    
-    return wasPressed
 end
 
-function checkGamepadButtonHeld(button)
-    if not Controls.checkGamepadButton then
-        return false
-    end
-    return Controls.checkGamepadButton(button)
+-- True on the frame the action goes down
+function Input.pressed(name)
+    return Input.held[name] and not Input.prev[name]
 end
 
--- Helper function to check for select/confirm button
-function isSelectPressed(pad, oldpad)
-    -- Check both keyboard Space and gamepad A button independently
-    local keyboardPressed = Controls.check(pad, SDLK_RETURN) and not Controls.check(oldpad, SDLK_RETURN)
-    local gamepadPressed = checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_A)
-    return keyboardPressed or gamepadPressed
+-- True on the first frame, then repeatedly while held
+function Input.repeated(name)
+    return Input.rep[name]
+end
+
+-- Ignore everything currently held until it is released
+function Input.block()
+    for name, down in pairs(Input.held) do
+        if down then Input.blocked[name] = true end
+        Input.held[name] = false
+        Input.rep[name] = false
+    end
+end
+
+function setGameState(state)
+    gameState = state
+    Input.block()
+end
+
+-- Move a menu selection up/down with wrap-around
+local function navigateMenu(state)
+    if Input.repeated("up") then
+        state.selectedIndex = state.selectedIndex - 1
+        if state.selectedIndex < 1 then state.selectedIndex = state.optionCount end
+        playSfx("nav")
+        return true
+    end
+    if Input.repeated("down") then
+        state.selectedIndex = state.selectedIndex + 1
+        if state.selectedIndex > state.optionCount then state.selectedIndex = 1 end
+        playSfx("nav")
+        return true
+    end
+    return false
+end
+
+-- Add the current session to the play-time statistics
+local function recordSession()
+    local sessionTime = (Timer.getTime(timer) - Game.sessionStart) / 1000
+    Game.totalPlayTime = Game.totalPlayTime + sessionTime
+    if sessionTime > Game.longestSession then
+        Game.longestSession = sessionTime
+    end
+    Game.sessionStart = Timer.getTime(timer)
+end
+
+-- Store pricing: each building costs 15% more than the last
+function buildingUnitPrice(building, count)
+    return math.floor(Button[building.."fprice"] * (1.15 ^ count))
+end
+
+function buildingBatchCost(building, quantity)
+    local count = Button[building.."count"]
+    local total = 0
+    for k = 0, quantity - 1 do
+        total = total + buildingUnitPrice(building, count + k)
+    end
+    return total
+end
+
+-- Selling refunds half of what each building would cost now
+function buildingBatchRefund(building, quantity)
+    local count = Button[building.."count"]
+    local total = 0
+    for k = 1, math.min(quantity, count) do
+        total = total + math.floor(buildingUnitPrice(building, count - k) * 0.5)
+    end
+    return total
+end
+
+-- The cheapest upgrade that is unlocked but not bought yet
+function nextUpgradeFor(building)
+    for i = 1, #Upgrade.Now do
+        local upgradeName = Upgrade.Now[i]
+        if Upgrade[upgradeName.."name"] == building then
+            return upgradeName
+        end
+    end
+    return nil
+end
+
+-- Purchases save shortly afterwards instead of on every press, so holding A
+-- to buy in bulk doesn't write the save file ten times a second
+local SAVE_DEBOUNCE = 1500
+local saveDue = nil
+local function requestSave()
+    saveDue = Timer.getTime(Input.clock) + SAVE_DEBOUNCE
+end
+
+function flushPendingSave(force)
+    if saveDue and (force or Timer.getTime(Input.clock) >= saveDue) then
+        saveDue = nil
+        saveGame()
+    end
+end
+
+local function buySelected()
+    local building = Button[GamepadState.selectedIndex]
+    if not building then return false end
+    local quantity = GamepadState.purchaseQuantity
+
+    if GamepadState.buyMode then
+        local cost = buildingBatchCost(building, quantity)
+        if Cookie.count < cost then return false end
+        Cookie.count = Cookie.count - cost
+        Cookie.totalSpent = Cookie.totalSpent + cost
+        Button[building.."count"] = Button[building.."count"] + quantity
+        Button[building.."total"] = Button[building.."total"] + quantity
+        Button[building.."spent"] = Button[building.."spent"] + cost
+        Game.totalBuildings = Game.totalBuildings + quantity
+        playSfx("buy")
+    else
+        local sold = math.min(quantity, Button[building.."count"])
+        if sold == 0 then return false end
+        Cookie.count = Cookie.count + buildingBatchRefund(building, sold)
+        Button[building.."count"] = Button[building.."count"] - sold
+        playSfx("sell")
+    end
+
+    Button[building.."price"] = buildingUnitPrice(building, Button[building.."count"])
+    Upgrade.update()
+    Upgrade.cps()
+    requestSave()
+    return true
+end
+
+local function buySelectedUpgrade()
+    local building = Button[GamepadState.selectedIndex]
+    local upgradeName = building and nextUpgradeFor(building)
+    if not upgradeName then return false end
+    local price = Upgrade[upgradeName.."price"]
+    if Cookie.count < price then return false end
+    Cookie.count = Cookie.count - price
+    Cookie.totalSpent = Cookie.totalSpent + price
+    Game.totalUpgrades = Game.totalUpgrades + 1
+    Upgrade[upgradeName.."a"] = 2
+    Upgrade.update()
+    Upgrade.cps()
+    requestSave()
+    playSfx("upgrade")
+    return true
+end
+
+local QUANTITIES = {1, 10, 100}
+local function stepQuantity(step)
+    local index = 1
+    for i, q in ipairs(QUANTITIES) do
+        if q == GamepadState.purchaseQuantity then index = i end
+    end
+    index = math.max(1, math.min(#QUANTITIES, index + step))
+    GamepadState.purchaseQuantity = QUANTITIES[index]
 end
 
 function handleInput(pad)
-    
+    Input.update(pad)
+
     -- Global exit - ESC key
-    if Controls.check(pad, SDLK_ESCAPE) and not Controls.check(oldpad, SDLK_ESCAPE) then
+    if Input.pressed("quit") then
         if gameState == "Game" then
-            -- Update play time statistics before saving
-            local currentTime = Timer.getTime(timer)
-            local sessionTime = (currentTime - Game.sessionStart) / 1000
-            Game.totalPlayTime = Game.totalPlayTime + sessionTime
-            if sessionTime > Game.longestSession then
-                Game.longestSession = sessionTime
-            end
+            recordSession()
+            saveDue = nil
             saveGame()
         end
         -- Stop music before exiting the program completely
         stopBackgroundMusic()
         System.exit()
     end
-    
-    -- Handle input based on current game state
+
     if gameState == "Title" then
-        handleTitleInput(pad)
+        handleTitleInput()
     elseif gameState == "Game" then
-        handleGameInput(pad)
-    elseif gameState == "Controls" then
-        handleControlsInput(pad)
+        handleGameInput()
     elseif gameState == "Settings" then
-        handleSettingsInput(pad)
-    elseif gameState == "Statistics" then
-        handleStatisticsInput(pad)
-    elseif gameState == "About" then
-        handleAboutInput(pad)
+        handleSettingsInput()
+    else
+        -- Controls, Statistics and About are read-only pages
+        handlePageInput()
     end
-    
-    -- oldpad will be updated in main game loop
 end
 
 -- Title screen input handling
-function handleTitleInput(pad)
-    -- Navigation with timing delay
-    if Timer.getTime(navTimer) >= NAV_DELAY then
-        -- Navigate menu options - Up/Down arrows or D-pad
-        local upPressed = (Controls.check(pad, SDLK_UP) and not Controls.check(oldpad, SDLK_UP)) or
-                          checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_DPAD_UP)
-        if upPressed then
-            MenuState.selectedIndex = MenuState.selectedIndex - 1
-            if MenuState.selectedIndex < 1 then
-                MenuState.selectedIndex = MenuState.optionCount
-            end
-            Timer.reset(navTimer)
-        end
-        
-        local downPressed = (Controls.check(pad, SDLK_DOWN) and not Controls.check(oldpad, SDLK_DOWN)) or
-                            checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN)
-        if downPressed then
-            MenuState.selectedIndex = MenuState.selectedIndex + 1
-            if MenuState.selectedIndex > MenuState.optionCount then
-                MenuState.selectedIndex = 1
-            end
-            Timer.reset(navTimer)
-        end
-    end
-    
-    -- Select option with timing delay
-    if Timer.getTime(buttonTimer) >= BUTTON_DELAY then
-        if isSelectPressed(pad, oldpad) then
-            local selectedOption = MenuState.options[MenuState.selectedIndex]
-            
-            if selectedOption == "Start" or selectedOption == "Continue" then
-                gameState = "Game"
-                -- Initialize session timer
-                Game.sessionStart = Timer.getTime(timer)
-            elseif selectedOption == "Settings" then
-                gameState = "Settings"
-            elseif selectedOption == "Controls" then
-                gameState = "Controls"
-            elseif selectedOption == "Statistics" then
-                gameState = "Statistics"
-            elseif selectedOption == "About" then
-                gameState = "About"
-            elseif selectedOption == "Exit" then
-                System.exit()
-            end
-            
-            Timer.reset(buttonTimer)
+function handleTitleInput()
+    navigateMenu(MenuState)
+
+    if Input.pressed("confirm") then
+        local selectedOption = MenuState.options[MenuState.selectedIndex]
+        playSfx("select")
+        if selectedOption == "Start" or selectedOption == "Continue" then
+            Game.sessionStart = Timer.getTime(timer)
+            setGameState("Game")
+        elseif selectedOption == "Exit" then
+            stopBackgroundMusic()
+            System.exit()
+        else
+            SettingsState.confirmReset = false
+            setGameState(selectedOption)
         end
     end
 end
 
--- Controls screen input handling
-function handleControlsInput(pad)
-    if Timer.getTime(buttonTimer) >= BUTTON_DELAY then
-        -- Return to title screen - Enter/A button, Backspace, or gamepad Start button
-        if isSelectPressed(pad, oldpad) or
-           (Controls.check(pad, SDLK_BACKSPACE) and not Controls.check(oldpad, SDLK_BACKSPACE)) or
-           checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_START) then
-            gameState = "Title"
-            Timer.reset(buttonTimer)
-        end
+-- Controls, Statistics and About: any of A / B / Start returns to the menu
+function handlePageInput()
+    if Input.pressed("back") or Input.pressed("confirm") or Input.pressed("pause") then
+        playSfx("back")
+        setGameState("Title")
     end
 end
 
 -- Settings screen input handling
-function handleSettingsInput(pad)
-    if Timer.getTime(navTimer) >= NAV_DELAY then
-        -- Navigate settings - Up/Down arrows
-        if Controls.check(pad, SDLK_UP) and not Controls.check(oldpad, SDLK_UP) then
-            SettingsState.selectedIndex = SettingsState.selectedIndex - 1
-            if SettingsState.selectedIndex < 1 then
-                SettingsState.selectedIndex = SettingsState.optionCount
-            end
-            Timer.reset(navTimer)
-        end
-        
-        if Controls.check(pad, SDLK_DOWN) and not Controls.check(oldpad, SDLK_DOWN) then
-            SettingsState.selectedIndex = SettingsState.selectedIndex + 1
-            if SettingsState.selectedIndex > SettingsState.optionCount then
-                SettingsState.selectedIndex = 1
-            end
-            Timer.reset(navTimer)
-        end
+function handleSettingsInput()
+    if navigateMenu(SettingsState) then
+        SettingsState.confirmReset = false
     end
-    
-    if Timer.getTime(buttonTimer) >= BUTTON_DELAY then
-        local selectedOption = SettingsState.options[SettingsState.selectedIndex]
-        
-        -- Toggle/Adjust selected option - Enter/A button/Left/Right
-        if isSelectPressed(pad, oldpad) then
-            if selectedOption == "Background Music" then
-                toggleBackgroundMusic()
-            elseif selectedOption == "Cookie Shower" then
-                VisualSettings.cookieShowerEnabled = not VisualSettings.cookieShowerEnabled
-            elseif selectedOption == "Milk Animation" then
-                VisualSettings.milkAnimationEnabled = not VisualSettings.milkAnimationEnabled
-            elseif selectedOption == "Reset Game" then
-                resetGame()
-            end
-            Timer.reset(buttonTimer)
-        end
-        
-        -- Adjust values - Left/Right arrows or D-pad
-        local leftPressed = (Controls.check(pad, SDLK_LEFT) and not Controls.check(oldpad, SDLK_LEFT)) or
-                           checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT)
-        if leftPressed then
-            if selectedOption == "Music Volume" then
-                AudioSettings.bgMusicVolume = math.max(0.0, AudioSettings.bgMusicVolume - 0.1)
-                updateMusicVolume()
-            elseif selectedOption == "Background Music" then
-                toggleBackgroundMusic()
-            elseif selectedOption == "Cookie Shower" then
-                VisualSettings.cookieShowerEnabled = not VisualSettings.cookieShowerEnabled
-            elseif selectedOption == "Milk Animation" then
-                VisualSettings.milkAnimationEnabled = not VisualSettings.milkAnimationEnabled
-            end
-            Timer.reset(buttonTimer)
-        end
-        
-        local rightPressed = (Controls.check(pad, SDLK_RIGHT) and not Controls.check(oldpad, SDLK_RIGHT)) or
-                            checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
-        if rightPressed then
-            if selectedOption == "Music Volume" then
-                AudioSettings.bgMusicVolume = math.min(1.0, AudioSettings.bgMusicVolume + 0.1)
-                updateMusicVolume()
-            elseif selectedOption == "Background Music" then
-                toggleBackgroundMusic()
-            elseif selectedOption == "Cookie Shower" then
-                VisualSettings.cookieShowerEnabled = not VisualSettings.cookieShowerEnabled
-            elseif selectedOption == "Milk Animation" then
-                VisualSettings.milkAnimationEnabled = not VisualSettings.milkAnimationEnabled
-            end
-            Timer.reset(buttonTimer)
-        end
-        
-        -- Return to title screen - Backspace or gamepad Start button
-        if (Controls.check(pad, SDLK_BACKSPACE) and not Controls.check(oldpad, SDLK_BACKSPACE)) or
-           checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_START) then
-            gameState = "Title"
-            Timer.reset(buttonTimer)
-        end
-    end
-end
 
--- About screen input handling
-function handleAboutInput(pad)
-    if Timer.getTime(buttonTimer) >= BUTTON_DELAY then
-        -- Return to title screen - Enter, Backspace, or gamepad Start button
-        if (Controls.check(pad, SDLK_RETURN) and not Controls.check(oldpad, SDLK_RETURN)) or
-           (Controls.check(pad, SDLK_BACKSPACE) and not Controls.check(oldpad, SDLK_BACKSPACE)) or
-           checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_START) then
-            gameState = "Title"
-            Timer.reset(buttonTimer)
-        end
-    end
-end
-
--- Statistics screen input handling
-function handleStatisticsInput(pad)
-    if Timer.getTime(buttonTimer) >= BUTTON_DELAY then
-        -- Return to title screen - Enter, Backspace, or gamepad Start button
-        if (Controls.check(pad, SDLK_RETURN) and not Controls.check(oldpad, SDLK_RETURN)) or
-           (Controls.check(pad, SDLK_BACKSPACE) and not Controls.check(oldpad, SDLK_BACKSPACE)) or
-           checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_START) then
-            gameState = "Title"
-            Timer.reset(buttonTimer)
-        end
-    end
-end
-
--- Game input handling (original input code)
-function handleGameInput(pad)
-    -- Return to title screen - Backspace or gamepad Start button
-    local backToMenuPressed = (Controls.check(pad, SDLK_BACKSPACE) and not Controls.check(oldpad, SDLK_BACKSPACE)) or
-                              checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_START)
-    if backToMenuPressed then
-        -- Update play time statistics before saving
-        local currentTime = Timer.getTime(timer)
-        local sessionTime = (currentTime - Game.sessionStart) / 1000
-        Game.totalPlayTime = Game.totalPlayTime + sessionTime
-        if sessionTime > Game.longestSession then
-            Game.longestSession = sessionTime
-        end
-        
-        saveGame()
-        gameState = "Title"
-        -- Update menu to show "Continue" since we just saved
-        MenuState.options[1] = "Continue"
+    if Input.pressed("back") or Input.pressed("pause") then
+        SettingsState.confirmReset = false
+        playSfx("back")
+        setGameState("Title")
         return
     end
-    
-    -- Cookie clicking - Check both keyboard X and gamepad X button independently
-    local keyboardXPressed = Controls.check(pad, SDLK_X) and not Controls.check(oldpad, SDLK_X)
-    local gamepadXPressed = checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_X)
-    
-    if keyboardXPressed or gamepadXPressed then
-        -- Button was just pressed, increment cookie count
+
+    local selectedOption = SettingsState.options[SettingsState.selectedIndex]
+    local function toggle()
+        if selectedOption == "Background Music" then
+            toggleBackgroundMusic()
+        elseif selectedOption == "Sound Effects" then
+            AudioSettings.sfxEnabled = not AudioSettings.sfxEnabled
+        elseif selectedOption == "Cookie Shower" then
+            VisualSettings.cookieShowerEnabled = not VisualSettings.cookieShowerEnabled
+        elseif selectedOption == "Milk Animation" then
+            VisualSettings.milkAnimationEnabled = not VisualSettings.milkAnimationEnabled
+        else
+            return  -- volume rows have nothing to toggle
+        end
+        playSfx("select")  -- silent when sound effects were just turned off
+    end
+
+    if Input.pressed("confirm") then
+        if selectedOption == "Reset Game" then
+            -- Ask twice: this wipes the save
+            if SettingsState.confirmReset then
+                SettingsState.confirmReset = false
+                resetGame()
+                playSfx("back")
+                Input.block()
+            else
+                SettingsState.confirmReset = true
+                playSfx("denied")  -- a warning before the second press
+            end
+        else
+            toggle()
+        end
+    end
+
+    local left, right = Input.repeated("left"), Input.repeated("right")
+    if left or right then
+        if selectedOption == "Music Volume" then
+            local step = right and 0.1 or -0.1
+            AudioSettings.bgMusicVolume = math.max(0.0, math.min(1.0, AudioSettings.bgMusicVolume + step))
+            AudioSettings.bgMusicVolume = math.floor(AudioSettings.bgMusicVolume * 10 + 0.5) / 10
+            updateMusicVolume()
+            playSfx("nav")
+        elseif selectedOption == "Effects Volume" then
+            local step = right and 0.1 or -0.1
+            AudioSettings.sfxVolume = math.max(0.0, math.min(1.0, AudioSettings.sfxVolume + step))
+            AudioSettings.sfxVolume = math.floor(AudioSettings.sfxVolume * 10 + 0.5) / 10
+            updateSfxVolume()
+            playSfx("click")  -- preview the new level
+        elseif Input.pressed("left") or Input.pressed("right") then
+            toggle()
+        end
+    end
+end
+
+-- Game input handling
+--
+-- One focus: the store list. The buildings view on the left follows the
+-- store selection, so there is no panel to switch to.
+function handleGameInput()
+    if Input.pressed("pause") then
+        recordSession()
+        saveDue = nil
+        saveGame()
+        MenuState.options[1] = "Continue"
+        playSfx("back")
+        setGameState("Title")
+        return
+    end
+
+    -- Click the cookie
+    if Input.pressed("click") then
         local cookiesEarned = 1 * Upgrade["CursorQuan"]
         Cookie.count = Cookie.count + cookiesEarned
         Cookie.total = Cookie.total + cookiesEarned
         Cookie.clicked = Cookie.clicked + cookiesEarned
         Cookie.clickCount = Cookie.clickCount + 1
         Cookie.tmp = 1
+        playSfx("click")
     end
-    
-    -- Panel navigation with timing delay
-    if Timer.getTime(navTimer) >= NAV_DELAY then
-        -- Switch panels - gamepad B button or Tab key (2-panel layout: Buildings -> Store)
-        local panelSwitchPressed = (Controls.check(pad, SDLK_TAB) and not Controls.check(oldpad, SDLK_TAB)) or
-                                  checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_B)
-        if panelSwitchPressed then
-            if GamepadState.currentPanel == "Buildings" then
-                GamepadState.currentPanel = "Store"
-            else
-                GamepadState.currentPanel = "Buildings"
-            end
+
+    -- Move through the store; a fresh press wraps around, holding stops at the ends
+    local count = #Button
+    local before = GamepadState.selectedIndex
+    if Input.repeated("up") then
+        if GamepadState.selectedIndex > 1 then
+            GamepadState.selectedIndex = GamepadState.selectedIndex - 1
+        elseif Input.pressed("up") then
+            GamepadState.selectedIndex = count
+        end
+    end
+    if Input.repeated("down") then
+        if GamepadState.selectedIndex < count then
+            GamepadState.selectedIndex = GamepadState.selectedIndex + 1
+        elseif Input.pressed("down") then
             GamepadState.selectedIndex = 1
-            Timer.reset(navTimer)
-        end
-        
-        -- Navigate within current panel - Arrow keys or D-pad Up/Down
-        local upPressed = (Controls.check(pad, SDLK_UP) and not Controls.check(oldpad, SDLK_UP)) or
-                          checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_DPAD_UP)
-        if upPressed then
-            if GamepadState.currentPanel == "Store" then
-                GamepadState.selectedIndex = math.max(1, GamepadState.selectedIndex - 1)
-            elseif GamepadState.currentPanel == "Buildings" then
-                GamepadState.selectedIndex = math.max(1, GamepadState.selectedIndex - 1)
-            else
-                GamepadState.selectedIndex = math.max(1, GamepadState.selectedIndex - 1)
-            end
-            Timer.reset(navTimer)
-        end
-        
-        local downPressed = (Controls.check(pad, SDLK_DOWN) and not Controls.check(oldpad, SDLK_DOWN)) or
-                            checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN)
-        if downPressed then
-            if GamepadState.currentPanel == "Store" then
-                GamepadState.selectedIndex = math.min(#Button, GamepadState.selectedIndex + 1)
-            elseif GamepadState.currentPanel == "Buildings" then
-                -- Count owned buildings to determine scroll limit
-                local ownedBuildings = 0
-                for i = 1, #Button do
-                    local building = Button[i]
-                    if building and Button[building.."count"] > 0 then
-                        ownedBuildings = ownedBuildings + 1
-                    end
-                end
-                
-                -- Calculate how many buildings fit on screen
-                local headerHeight = math.floor(40 * scaleY)
-                local availableHeight = screenH - headerHeight - math.floor(20 * scaleY)
-                local buildingHeight = math.floor(144 * ((PANEL_LEFT_WIDTH - math.floor(10 * scaleX)) / 332))
-                local buildingsOnScreen = math.floor(availableHeight / buildingHeight)
-                
-                -- Allow scrolling through all owned buildings with extra room
-                -- Since you can see ~2.5 buildings at once, allow more scroll positions
-                local maxScrollSteps = math.max(ownedBuildings, ownedBuildings + 3)  -- Always allow at least a few extra steps
-                
-                GamepadState.selectedIndex = math.min(maxScrollSteps, GamepadState.selectedIndex + 1)
-                
-            else
-                GamepadState.selectedIndex = GamepadState.selectedIndex + 1
-            end
-            Timer.reset(navTimer)
         end
     end
-    
-    -- Purchase actions with timing delay
-    if Timer.getTime(buttonTimer) >= BUTTON_DELAY then
-        -- Purchase/Sell selected item - Check both keyboard Space and gamepad A button independently
-        local keyboardSpacePressed = Controls.check(pad, SDLK_RETURN) and not Controls.check(oldpad, SDLK_RETURN)
-        local gamepadAPressed = checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_A)
-        local selectPressed = keyboardSpacePressed or gamepadAPressed
-        if selectPressed then
-            if GamepadState.currentPanel == "Store" then
-                local selectedBuilding = Button[GamepadState.selectedIndex]
-                if selectedBuilding then
-                    if GamepadState.buyMode then
-                        -- Purchase building
-                        if Cookie.count >= Button[selectedBuilding.."price"] then
-                            local cost = Button[selectedBuilding.."price"]
-                            Cookie.count = Cookie.count - cost
-                            Cookie.totalSpent = Cookie.totalSpent + cost
-                            Button[selectedBuilding.."count"] = Button[selectedBuilding.."count"] + GamepadState.purchaseQuantity
-                            Button[selectedBuilding.."total"] = Button[selectedBuilding.."total"] + GamepadState.purchaseQuantity
-                            Button[selectedBuilding.."spent"] = Button[selectedBuilding.."spent"] + cost
-                            Game.totalBuildings = Game.totalBuildings + GamepadState.purchaseQuantity
-                            -- Update price with exponential scaling
-                            Button[selectedBuilding.."price"] = math.floor(Button[selectedBuilding.."fprice"] * (1.15 ^ Button[selectedBuilding.."count"]))
-                            -- Auto-save after purchase
-                            saveGame()
-                        end
-                    else
-                        -- Sell building
-                        if Button[selectedBuilding.."count"] >= GamepadState.purchaseQuantity then
-                            Button[selectedBuilding.."count"] = Button[selectedBuilding.."count"] - GamepadState.purchaseQuantity
-                            -- Update price
-                            Button[selectedBuilding.."price"] = math.floor(Button[selectedBuilding.."fprice"] * (1.15 ^ Button[selectedBuilding.."count"]))
-                            -- Refund 50% of current price
-                            local refund = math.floor(Button[selectedBuilding.."price"] * 0.5 * GamepadState.purchaseQuantity)
-                            Cookie.count = Cookie.count + refund
-                            -- Auto-save after selling
-                            saveGame()
-                        end
-                    end
-                end
-            end
-            Timer.reset(buttonTimer)
+
+    -- Buy amount: left/right step through 1/10/100
+    local quantityBefore = GamepadState.purchaseQuantity
+    if Input.pressed("left") then stepQuantity(-1) end
+    if Input.pressed("right") then stepQuantity(1) end
+
+    -- Buy/sell toggle (L or R)
+    if Input.pressed("mode") then
+        GamepadState.buyMode = not GamepadState.buyMode
+        playSfx("select")
+    end
+
+    -- Tick when the selection or amount actually changes (not when stuck at an end)
+    if GamepadState.selectedIndex ~= before or GamepadState.purchaseQuantity ~= quantityBefore then
+        playSfx("nav")
+    end
+
+    -- Buy or sell; holding A keeps buying
+    if Input.repeated("confirm") then
+        -- Only a fresh press complains, not every repeat while A is held
+        if not buySelected() and Input.pressed("confirm") then
+            playSfx("denied")
         end
-        
-        -- Purchase upgrade for selected building - Y button or Y key
-        local upgradePressed = (Controls.check(pad, SDLK_Y) and not Controls.check(oldpad, SDLK_Y)) or
-                              checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_Y)
-        if upgradePressed then
-            if GamepadState.currentPanel == "Store" then
-                local selectedBuilding = Button[GamepadState.selectedIndex]
-                if selectedBuilding then
-                    print("Trying to upgrade: " .. selectedBuilding)
-                    print("Available upgrades count: " .. #Upgrade.Now)
-                    
-                    -- Find available upgrades for this building
-                    local buildingUpgrades = {}
-                    for i = 1, #Upgrade.Now do
-                        local upgradeName = Upgrade.Now[i]
-                        print("Checking upgrade: " .. upgradeName .. " for building: " .. Upgrade[upgradeName.."name"])
-                        if Upgrade[upgradeName.."name"] == selectedBuilding then
-                            table.insert(buildingUpgrades, upgradeName)
-                            print("Found matching upgrade: " .. upgradeName)
-                        end
-                    end
-                    
-                    print("Building upgrades found: " .. #buildingUpgrades)
-                    
-                    -- Purchase the first available upgrade for this building
-                    if #buildingUpgrades > 0 then
-                        local upgradeToBy = buildingUpgrades[1]
-                        local upgradePrice = Upgrade[upgradeToBy.."price"]
-                        print("Upgrade price: " .. upgradePrice .. ", Cookie count: " .. Cookie.count)
-                        if Cookie.count >= upgradePrice then
-                            Cookie.count = Cookie.count - upgradePrice
-                            Cookie.totalSpent = Cookie.totalSpent + upgradePrice
-                            Game.totalUpgrades = Game.totalUpgrades + 1
-                            Upgrade[upgradeToBy.."a"] = 2  -- Mark as purchased
-                            print("Upgrade purchased!")
-                            -- Auto-save after upgrade purchase
-                            saveGame()
-                        else
-                            print("Not enough cookies for upgrade")
-                        end
-                    else
-                        print("No upgrades available for this building")
-                    end
-                end
-            end
-            Timer.reset(buttonTimer)
-        end
-        
-        -- Toggle buy/sell mode - L button (left shoulder) or T key
-        local toggleModePressed = (Controls.check(pad, SDLK_T) and not Controls.check(oldpad, SDLK_T)) or
-                                 checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_LEFTSHOULDER)
-        if toggleModePressed then
-            GamepadState.buyMode = not GamepadState.buyMode
-            Timer.reset(buttonTimer)
-        end
-        
-        -- Cycle purchase quantity - R button (right shoulder) or R key
-        local quantityPressed = (Controls.check(pad, SDLK_R) and not Controls.check(oldpad, SDLK_R)) or
-                               checkGamepadButtonPressed(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)
-        if quantityPressed then
-            if GamepadState.purchaseQuantity == 1 then
-                GamepadState.purchaseQuantity = 10
-            elseif GamepadState.purchaseQuantity == 10 then
-                GamepadState.purchaseQuantity = 100
-            else
-                GamepadState.purchaseQuantity = 1
-            end
-            Timer.reset(buttonTimer)
+    end
+
+    -- Buy the next upgrade for the selected building
+    if Input.pressed("upgrade") then
+        if not buySelectedUpgrade() then
+            playSfx("denied")
         end
     end
 end
 
 -- Panel drawing functions (2-panel layout)
+
+-- Button hints in the buildings header, right-aligned
+function drawGameHints()
+    local hints = {
+        {"B", "Click"},
+        {"A", GamepadState.buyMode and "Buy" or "Sell"},
+        {"Y", "Upgrade"},
+        {"L/R", GamepadState.buyMode and "Sell" or "Buy"},
+        {"Start", "Menu"},
+    }
+    local gap = math.floor(10 * scaleX)
+    local total = 0
+    for i, hint in ipairs(hints) do
+        total = total + textWidth(smallFont, hint[1]) + 4 + textWidth(smallFont, hint[2]) + (i > 1 and gap or 0)
+    end
+    local labelEnd = PANEL_LEFT_X + math.floor(10 * scaleX) + textWidth(defaultFont, "BUILDINGS") + math.floor(14 * scaleX)
+    local right = PANEL_LEFT_X + PANEL_LEFT_WIDTH - math.floor(10 * scaleX)
+    while #hints > 0 and right - total < labelEnd do
+        local last = hints[#hints]
+        total = total - textWidth(smallFont, last[1]) - 4 - textWidth(smallFont, last[2]) - (#hints > 1 and gap or 0)
+        hints[#hints] = nil
+    end
+    local x = right - total
+    local y = math.floor(7 * scaleY) - 2
+    for i, hint in ipairs(hints) do
+        if i > 1 then x = x + gap end
+        drawSmallText(x, y, hint[1], gold)
+        x = x + textWidth(smallFont, hint[1]) + 4
+        drawSmallText(x, y, hint[2], white)
+        x = x + textWidth(smallFont, hint[2])
+    end
+end
 function drawPanels()
     -- Draw vertical panel separator between buildings and cookie/store
     if Texture["panelVertical"] then
@@ -1418,8 +1505,7 @@ function drawPanels()
     
     -- Draw panel headers (after background overlay so they appear on top)
     drawText(PANEL_LEFT_X + math.floor(10 * scaleX), math.floor(5 * scaleY) - 3, "BUILDINGS", white)
-    -- Draw panel indicator to the right of BUILDINGS header
-    drawText(PANEL_LEFT_X + math.floor(120 * scaleX), math.floor(5 * scaleY) - 3, "PANEL: " .. GamepadState.currentPanel, white)
+    drawGameHints()
     
     -- Draw horizontal divider below BUILDINGS header (solid first, then gradient on top)
     if Texture["panelHorizontal"] then
@@ -1440,143 +1526,87 @@ function drawPanels()
         Graphics.drawImageExtended(PANEL_LEFT_X + PANEL_LEFT_WIDTH/2, horizontalY, 0, 0, gradientW, gradientH, 0, gradientScaleX, gradientScaleY, Texture["panelGradientTop"])
     end
     
-    -- Draw store header with buy/sell mode and quantity
-    drawText(PANEL_RIGHT_X + math.floor(10 * scaleX), COOKIE_AREA_HEIGHT + math.floor(35 * scaleY) - 3, "STORE", white)
-    local modeText = GamepadState.buyMode and "BUY" or "SELL"
-    local modeColor = GamepadState.buyMode and green or red
-    drawText(PANEL_RIGHT_X + math.floor(80 * scaleX), COOKIE_AREA_HEIGHT + math.floor(35 * scaleY) - 3, modeText, modeColor)
-    
-    -- Draw quantity selector (1  10  100)
-    local quantityX = PANEL_RIGHT_X + math.floor(130 * scaleX)
-    local quantityY = COOKIE_AREA_HEIGHT + math.floor(35 * scaleY) - 3
-    local darkGray = Color.new(50, 50, 50)
-    
-    -- Draw "1" quantity
-    local color1 = GamepadState.purchaseQuantity == 1 and white or darkGray
-    drawText(quantityX, quantityY, "1", color1)
-    
-    -- Draw "10" quantity (with 2 spaces between)
-    local color10 = GamepadState.purchaseQuantity == 10 and white or darkGray
-    drawText(quantityX + math.floor(24 * scaleX), quantityY, "10", color10)
-    
-    -- Draw "100" quantity (with 2 spaces between)
-    local color100 = GamepadState.purchaseQuantity == 100 and white or darkGray
-    drawText(quantityX + math.floor(56 * scaleX), quantityY, "100", color100)
+    -- Store header: STORE  BUY  1 10 100, spaced by measured text width
+    local headerY = COOKIE_AREA_HEIGHT + math.floor(35 * scaleY) - 3
+    local headerX = PANEL_RIGHT_X + math.floor(10 * scaleX)
+    local gap = math.floor(14 * scale)
+    drawText(headerX, headerY, "STORE", white)
+    headerX = headerX + textWidth(defaultFont, "STORE") + gap
+    drawText(headerX, headerY, GamepadState.buyMode and "BUY" or "SELL", GamepadState.buyMode and green or red)
+    headerX = headerX + textWidth(defaultFont, "SELL") + gap
+    local dim = Color.new(110, 110, 110)
+    for _, q in ipairs({1, 10, 100}) do
+        local label = tostring(q)
+        drawText(headerX, headerY, label, GamepadState.purchaseQuantity == q and white or dim)
+        headerX = headerX + textWidth(defaultFont, label) + math.floor(gap * 0.7)
+    end
 end
 
 function drawBuildings()
-    -- Start buildings at a good visible position
-    local firstBuildingY = -20  -- Start higher, closer to header area
-    
-    -- Calculate actual scaled building height from the BLDBacks scaling
+    -- Only owned buildings get a row (Cursor has no row; its cursors circle the cookie)
+    local rows = {}
+    local selectedRow = 1
+    local selectedBuilding = Button[GamepadState.selectedIndex]
+    for i = 1, #Button do
+        local building = Button[i]
+        if (Button[building.."id"] or 1) >= 2 and Button[building.."count"] > 0 then
+            rows[#rows + 1] = building
+        end
+        -- Follow the store selection; an unowned building shows the nearest row before it
+        if i <= GamepadState.selectedIndex and #rows > 0 then
+            selectedRow = #rows
+        end
+    end
+    if #rows == 0 then
+        return
+    end
+
     local backW = Graphics.getImageWidth(Texture["BLDBacks"]) or 332
     local backH = 144  -- Each slice is 144px tall
     local frameWidth = PANEL_LEFT_WIDTH - math.floor(10 * scaleX)
-    local scaleWidth = frameWidth / backW
-    local scaleHeight = scaleWidth  -- We use uniform scaling
-    local actualBuildingHeight = math.floor(backH * scaleHeight)
-    
-    -- Always apply a base offset to position buildings better, plus scrolling when in Buildings panel
-    local buildingScrollOffset = -110  -- Negative offset to move buildings UP (base position, raised by 10px total)
-    
-    if GamepadState.currentPanel == "Buildings" then
-        -- Calculate how many buildings we own
-        local ownedBuildings = 0
-        for i = 1, #Button do
-            if Button[Button[i].."count"] > 0 then
-                ownedBuildings = ownedBuildings + 1
-            end
-        end
-        
-        -- Calculate how many buildings can fit on screen
-        local headerHeight = math.floor(40 * scaleY)  -- Buildings header space
-        local availableHeight = screenH - headerHeight - math.floor(20 * scaleY)  -- Screen minus header and padding
-        local buildingsOnScreen = math.floor(availableHeight / actualBuildingHeight)
-        
-        -- Always scroll based on selectedIndex, but use smaller increments
-        -- This allows better visibility of buildings since you can see ~2.5 buildings at once
-        local scrollIncrement = actualBuildingHeight * 0.6  -- Scroll by 60% of building height per step
-        local scrollAmount = (GamepadState.selectedIndex - 1) * scrollIncrement
-        buildingScrollOffset = -110 - scrollAmount  -- Subtract to scroll UP when selecting down
-        
-        -- Calculate maximum scroll to keep last building fully visible
-        local lastBuildingY = (#Button - 1) * actualBuildingHeight  -- Position of last building
-        local targetBottomY = screenH - math.floor(20 * scaleY)  -- Bottom of visible area
-        local headerOffset = math.floor(40 * scaleY)  -- Buildings header space
-        local maxNeededScroll = lastBuildingY + actualBuildingHeight - (targetBottomY - headerOffset)
-        local maxScrollOffset = -110 - maxNeededScroll
-        
-        -- Don't scroll past the point where last building is fully visible
-        if buildingScrollOffset < maxScrollOffset then
-            buildingScrollOffset = maxScrollOffset
-        end
-        
+    local rowScale = frameWidth / backW
+    local rowHeight = math.floor(backH * rowScale)
+    local top = math.floor(30 * scaleY)
+    local visibleHeight = screenH - top
+
+    -- Centre the selected row, ease towards it
+    local target = (selectedRow - 1) * rowHeight - (visibleHeight - rowHeight) / 2
+    target = math.max(0, math.min(target, #rows * rowHeight - visibleHeight))
+    BuildingView.scroll = BuildingView.scroll + (target - BuildingView.scroll) * 0.25
+    if math.abs(target - BuildingView.scroll) < 1 then
+        BuildingView.scroll = target
     end
-    
-    for i = 1, #Button do
-        local building = Button[i]
-        if building then
-            -- Each building starts at the bottom of the previous building
-            local y = firstBuildingY + (i - 1) * actualBuildingHeight + buildingScrollOffset
-            
-            -- Only draw if visible in left panel
-            if y > -100 and y < screenH then
-                local x = PANEL_LEFT_X + math.floor(5 * scaleX)
-                local frameWidth = PANEL_LEFT_WIDTH - math.floor(10 * scaleX)
-                local frameHeight = actualBuildingHeight  -- Match the actual scaled building height
-                
-                -- Only draw building backgrounds if owned (Cursor has no background)
-                if Texture["BLDBacks"] and Button[building.."count"] > 0 then
-                    local buildingId = Button[building.."id"] or 1
-                    
-                    -- Use Vita formula: (id - 2) - Cursor (ID 1) has no background
-                    if buildingId >= 2 then
-                        local backSliceY = (buildingId - 2) * 144  -- Each building back is 144px tall
-                        
-                        -- Scale more like Vita version - preserve aspect ratio better
-                        local backW = Graphics.getImageWidth(Texture["BLDBacks"]) or 332
-                        local backH = 144  -- Each slice is 144px tall
-                        -- Scale to fit width, let height be natural
-                        local scale = frameWidth / backW
-                        local scaleWidth = scale
-                        local scaleHeight = scale
-                        
-                        Graphics.drawImageExtended(x + frameWidth/2, y + frameHeight/2 - 1, 
-                            0, backSliceY, backW, backH, 0, scaleWidth * 1.006, scaleHeight, Texture["BLDBacks"])
-                        
-                        -- Draw BLDIcons on top of background
-                        if Texture["BLDIcons"] then
-                            local iconSliceX = 64 * (buildingId - 2) + 1  -- Add 1 pixel offset to avoid left border
-                            local buildingCount = Button[building.."count"]
-                            
-                            -- Icon display with multiple rows
-                            local maxIconsPerRow = math.floor(frameWidth / (25 * scale))  -- Calculate how many fit horizontally
-                            local maxRows = 2  -- Support up to 2 rows
-                            local maxIconsTotal = maxIconsPerRow * maxRows
-                            local iconsToShow = math.min(buildingCount, maxIconsTotal)
-                            local iconScale = scale * 1.0
-                            local iconSpacing = math.floor(25 * scale)
-                            local rowSpacing = math.floor(30 * scale)  -- Vertical spacing between rows
-                            
-                            for iconNum = 1, iconsToShow do
-                                -- Calculate row and column for this icon
-                                local row = math.floor((iconNum - 1) / maxIconsPerRow)
-                                local col = (iconNum - 1) % maxIconsPerRow
-                                
-                                local iconX = x + math.floor(30 * scaleX) + col * iconSpacing
-                                local iconY = y + math.floor(60 * scaleY) + row * rowSpacing
-                                
-                                -- Only draw icon if it fits within the background frame boundaries
-                                local iconSize = 62 * iconScale
-                                if iconX + iconSize/2 <= x + frameWidth then
-                                    Graphics.drawImageExtended(iconX, iconY, iconSliceX, 0, 62, 64, 0, iconScale, iconScale, Texture["BLDIcons"])
-                                end
-                            end
-                        end
+
+    local x = PANEL_LEFT_X + math.floor(5 * scaleX)
+    for k, building in ipairs(rows) do
+        local y = math.floor(top + (k - 1) * rowHeight - BuildingView.scroll)
+        if y + rowHeight > 0 and y < screenH then
+            local buildingId = Button[building.."id"]
+            local backSliceY = (buildingId - 2) * 144
+            Graphics.drawImageExtended(x + frameWidth/2, y + rowHeight/2 - 1,
+                0, backSliceY, backW, backH, 0, rowScale * 1.006, rowScale, Texture["BLDBacks"])
+
+            if Texture["BLDIcons"] then
+                local iconSliceX = 64 * (buildingId - 2) + 1  -- 1px in to skip the border
+                local maxIconsPerRow = math.floor(frameWidth / (25 * rowScale))
+                local iconsToShow = math.min(Button[building.."count"], maxIconsPerRow * 2)
+                local iconSpacing = math.floor(25 * rowScale)
+                local rowSpacing = math.floor(30 * rowScale)
+                local iconSize = 62 * rowScale
+                for iconNum = 1, iconsToShow do
+                    local row = math.floor((iconNum - 1) / maxIconsPerRow)
+                    local col = (iconNum - 1) % maxIconsPerRow
+                    local iconX = x + math.floor(30 * scaleX) + col * iconSpacing
+                    local iconY = y + math.floor(60 * scaleY) + row * rowSpacing
+                    if iconX + iconSize/2 <= x + frameWidth then
+                        Graphics.drawImageExtended(iconX, iconY, iconSliceX, 0, 62, 64, 0, rowScale, rowScale, Texture["BLDIcons"])
                     end
                 end
-                
-                -- Buildings panel shows only visual backgrounds, no selection overlay
+            end
+
+            -- Tie the row to the store selection
+            if building == selectedBuilding then
+                drawFrame(x, y, frameWidth, rowHeight, 2, gold)
             end
         end
     end
@@ -1588,7 +1618,7 @@ function drawCookie()
         local cookieY = CENTER_OF_COOKIE_Y
         
         -- Use smaller cookie size to make room for upgrades
-        local cookieScale = 0.45  -- Even smaller to fit upgrades
+        local cookieScale = 0.45 * scale
         
         -- Add click animation
         if Cookie.tmp > 0 then
@@ -1782,90 +1812,107 @@ function drawStoreBackground()
 end
 
 function drawStore()
-    local itemHeight = math.floor(50 * scaleY)  -- Remove gaps between buttons
-    local startY = COOKIE_AREA_HEIGHT + HEADER_HEIGHT + UPGRADE_HEIGHT + math.floor(10 * scaleY)  -- Start right after the horizontal divider
-    
-    -- Simple scrolling like 3DS version
-    local scrollOffset = 0
-    if GamepadState.currentPanel == "Store" and GamepadState.selectedIndex > 3 then
-        -- Start scrolling after the 3rd item to keep them in view
-        scrollOffset = -(GamepadState.selectedIndex - 3) * itemHeight
+    local itemHeight = math.floor(50 * scaleY)
+    local listTop = COOKIE_AREA_HEIGHT + HEADER_HEIGHT + UPGRADE_HEIGHT + math.floor(10 * scaleY)
+    local visibleHeight = screenH - listTop
+
+    -- Keep the selection in the middle of the list where possible, eased
+    local target = (GamepadState.selectedIndex - 1) * itemHeight - (visibleHeight - itemHeight) / 2
+    target = math.max(0, math.min(target, #Button * itemHeight - visibleHeight))
+    StoreView.scroll = StoreView.scroll + (target - StoreView.scroll) * 0.3
+    if math.abs(target - StoreView.scroll) < 1 then
+        StoreView.scroll = target
     end
-    
+
+    local x = PANEL_RIGHT_X
+    local frameWidth = PANEL_RIGHT_WIDTH
+    local quantity = GamepadState.purchaseQuantity
+
     for i = 1, #Button do
         local building = Button[i]
-        if building then
-            local y = startY + (i - 1) * itemHeight + scrollOffset
-            
-            -- Only draw if visible in store area of right panel (below upgrade area)
-            local minVisibleY = COOKIE_AREA_HEIGHT + HEADER_HEIGHT + UPGRADE_HEIGHT + math.floor(5 * scaleY)
-            if y > minVisibleY and y < screenH then
-                local x = PANEL_RIGHT_X  -- Start at panel edge (no left gap)
-                local frameWidth = PANEL_RIGHT_WIDTH  -- Full width to panel edge (no right gap)
-                local frameHeight = itemHeight  -- Match item height exactly for no gaps
-                
-                -- Draw storeTile.jpg background
-                if Texture["StoreTile"] then
-                    local tileW = Graphics.getImageWidth(Texture["StoreTile"]) or 64
-                    local tileH = Graphics.getImageHeight(Texture["StoreTile"]) or 64
-                    local scaleWidth = frameWidth / tileW
-                    local scaleHeight = frameHeight / tileH
-                    Graphics.drawImageExtended(x + frameWidth/2, y + frameHeight/2, 0, 0, tileW, tileH, 0, scaleWidth, scaleHeight, Texture["StoreTile"])
-                else
-                    -- Fallback: draw a solid rectangle if StoreTile is missing
-                    Graphics.fillRect(x, x + frameWidth, y, y + frameHeight, Color.new(100, 100, 100))
-                end
-                
-                -- Apply pressed tile overlay to non-selected items for inset effect
-                if GamepadState.currentPanel == "Store" and GamepadState.selectedIndex ~= i then
-                    if Texture["PressedTile"] then
-                        local pressedW = Graphics.getImageWidth(Texture["PressedTile"]) or 64
-                        local pressedH = Graphics.getImageHeight(Texture["PressedTile"]) or 64
-                        local pressedScaleX = frameWidth / pressedW
-                        local pressedScaleY = frameHeight / pressedH
-                        Graphics.drawImageExtended(x + frameWidth/2, y + frameHeight/2, 0, 0, pressedW, pressedH, 0, pressedScaleX, pressedScaleY, Texture["PressedTile"])
-                    end
-                end
-                
-                -- Draw building icon from buildings.png (using Vita formula)
-                if Texture["Buildings"] then
-                    local buildingId = Button[building.."id"] or 1
-                    
-                    -- Unlocked if you own at least one of this building
-                    local isUnlocked = Button[building.."count"] > 0
-                    local iconSliceX = isUnlocked and 0 or 64  -- X=0 for unlocked, X=64 for locked
-                    local iconSliceY = 64 * (buildingId - 1)  -- Row based on building ID
-                    
-                    local iconSize = math.floor(40 * scale)  -- Bigger icon size
-                    local iconX = x + math.floor(25 * scaleX)  -- Move icon slightly more right
-                    local iconY = y + frameHeight/2
-                    
-                    Graphics.drawImageExtended(iconX, iconY, iconSliceX + 1, iconSliceY, 62, 64, 0, iconSize/62, iconSize/64, Texture["Buildings"])
-                end
-                
-                -- Draw building name (to the right of icon)
-                local textX = x + math.floor(55 * scaleX)  -- Move text closer to icon
-                drawText(textX, y + 5, building, white)
-                
-                -- Draw favicon cookie + cost below name
-                if Texture["Favicon"] then
-                    local cookieIconSize = math.floor(12 * scale)
-                    local cookieX = textX
-                    local cookieY = y + math.floor(35 * scaleY)  -- Move favicon even lower
-                    
-                    Graphics.drawImageExtended(cookieX, cookieY, 0, 0, 16, 16, 0, cookieIconSize/16, cookieIconSize/16, Texture["Favicon"])
-                    
-                    -- Draw cost next to cookie icon with smaller font
-                    local price = Button[building.."price"]
-                    local priceColor = Cookie.count >= price and green or red
-                    drawSmallText(cookieX + cookieIconSize + 3, cookieY - 10, formatCookieCount(price), priceColor)
-                end
-                
-                -- Draw count on far right
-                local ownCount = Button[building.."count"]
-                local countX = x + frameWidth - math.floor(30 * scaleX)
-                drawText(countX, y + frameHeight/2 - 5, tostring(ownCount), white)
+        local y = math.floor(listTop + (i - 1) * itemHeight - StoreView.scroll)
+        -- Rows that slide under the upgrade bar are covered by drawStoreMask()
+        if y + itemHeight > listTop and y < screenH then
+            local selected = GamepadState.selectedIndex == i
+
+            if Texture["StoreTile"] then
+                local tileW = Graphics.getImageWidth(Texture["StoreTile"]) or 64
+                local tileH = Graphics.getImageHeight(Texture["StoreTile"]) or 64
+                Graphics.drawImageExtended(x + frameWidth/2, y + itemHeight/2, 0, 0, tileW, tileH, 0, frameWidth / tileW, itemHeight / tileH, Texture["StoreTile"])
+            else
+                Graphics.fillRect(x, x + frameWidth, y, y + itemHeight, Color.new(100, 100, 100))
             end
+
+            -- Unselected rows look pressed in
+            if not selected and Texture["PressedTile"] then
+                local pressedW = Graphics.getImageWidth(Texture["PressedTile"]) or 64
+                local pressedH = Graphics.getImageHeight(Texture["PressedTile"]) or 64
+                Graphics.drawImageExtended(x + frameWidth/2, y + itemHeight/2, 0, 0, pressedW, pressedH, 0, frameWidth / pressedW, itemHeight / pressedH, Texture["PressedTile"])
+            end
+
+            if Texture["Buildings"] then
+                local buildingId = Button[building.."id"] or 1
+                local iconSliceX = Button[building.."count"] > 0 and 0 or 64  -- locked icons are the right column
+                local iconSize = math.floor(40 * scale)
+                Graphics.drawImageExtended(x + math.floor(25 * scaleX), y + itemHeight/2, iconSliceX + 1, 64 * (buildingId - 1), 62, 64, 0, iconSize/62, iconSize/64, Texture["Buildings"])
+            end
+
+            local textX = x + math.floor(55 * scaleX)
+            local ownText = tostring(Button[building.."count"])
+            local ownX = x + frameWidth - textWidth(defaultFont, ownText) - math.floor(12 * scaleX)
+            -- Long names (AntimatterCondenser) drop to the small font so they clear the count
+            if textX + textWidth(defaultFont, building) > ownX - 6 then
+                drawSmallText(textX, y + 7, building, white)
+            else
+                drawText(textX, y + 5, building, white)
+            end
+
+            -- Price of the whole batch (buy) or what selling it returns (sell)
+            if Texture["Favicon"] then
+                local cookieIconSize = math.floor(12 * scale)
+                local cookieY = y + math.floor(35 * scaleY)
+                Graphics.drawImageExtended(textX, cookieY, 0, 0, 16, 16, 0, cookieIconSize/16, cookieIconSize/16, Texture["Favicon"])
+
+                local priceText, priceColor
+                if GamepadState.buyMode then
+                    local cost = buildingBatchCost(building, quantity)
+                    priceText = formatCookieCount(cost)
+                    priceColor = Cookie.count >= cost and green or red
+                else
+                    local refund = buildingBatchRefund(building, quantity)
+                    priceText = "+" .. formatCookieCount(refund)
+                    priceColor = refund > 0 and gold or grey
+                end
+                drawSmallText(textX + cookieIconSize + 3, cookieY - math.floor(SMALL_FONT_SIZE * 0.8), priceText, priceColor)
+            end
+
+            -- Owned count, right-aligned so 4+ digits fit
+            drawText(ownX, y + itemHeight/2 - math.floor(FONT_SIZE * 0.6), ownText, white)
+
+            if selected then
+                drawFrame(x + 2, y, frameWidth - 4, itemHeight, 2, gold)
+            end
+        end
+    end
+end
+
+-- Repaint the strip between the store header and the list so scrolled rows
+-- disappear under it instead of popping out
+function drawStoreMask()
+    local maskTop = COOKIE_AREA_HEIGHT + HEADER_HEIGHT - math.floor(2 * scaleY)
+    local maskBottom = COOKIE_AREA_HEIGHT + HEADER_HEIGHT + UPGRADE_HEIGHT + math.floor(10 * scaleY)
+    local maskHeight = maskBottom - maskTop
+    for _, name in ipairs({"Background", "Darkback"}) do
+        local tex = Texture[name]
+        if tex then
+            local texW = Graphics.getImageWidth(tex) or 960
+            local texH = Graphics.getImageHeight(tex) or 544
+            local srcX = (PANEL_RIGHT_X / screenW) * texW
+            local srcY = (maskTop / screenH) * texH
+            local srcW = (PANEL_RIGHT_WIDTH / screenW) * texW
+            local srcH = (maskHeight / screenH) * texH
+            Graphics.drawImageExtended(PANEL_RIGHT_X + PANEL_RIGHT_WIDTH/2, maskTop + maskHeight/2,
+                srcX, srcY, srcW, srcH, 0, PANEL_RIGHT_WIDTH/srcW, maskHeight/srcH, tex)
         end
     end
 end
@@ -1931,96 +1978,61 @@ function drawCursors(cookieX, cookieY, cookieScale)
 end
 
 function drawUpgrades()
-    -- Only show upgrades when in Store panel
-    if GamepadState.currentPanel ~= "Store" then
-        return
-    end
-    
-    -- Get currently selected building
     local selectedBuilding = Button[GamepadState.selectedIndex]
     if not selectedBuilding then
         return
     end
-    
-    -- Draw upgrade area slightly above center between the two horizontal dividers
+    local nextUpgrade = nextUpgradeFor(selectedBuilding)
+
     local upgradeAreaTop = COOKIE_AREA_HEIGHT + HEADER_HEIGHT
-    local upgradeAreaBottom = COOKIE_AREA_HEIGHT + HEADER_HEIGHT + UPGRADE_HEIGHT
-    local upgradeY = upgradeAreaTop + (upgradeAreaBottom - upgradeAreaTop) * 0.48 + math.floor(2 * scaleY) - 4
+    local upgradeY = upgradeAreaTop + UPGRADE_HEIGHT * 0.48 + math.floor(2 * scaleY) - 4
     local upgradeX = PANEL_RIGHT_X + math.floor(6 * scaleX)
-    
-    -- Show all 4 upgrade slots for the selected building
+    local frameSize = math.floor(40 * scale)
+
     for i = 1, 4 do
         local upgradeName = selectedBuilding .. i
         local frameX = upgradeX + (i - 1) * math.floor(42 * scaleX)
-        local frameSize = math.floor(40 * scale)
-        
-        -- Check if this upgrade exists and process it
-        if Upgrade[upgradeName.."price"] then
-            -- Check upgrade status
+
+        if Upgrade[upgradeName.."price"] and Texture["UpgradeFrame"] then
             local upgradeStatus = Upgrade[upgradeName.."a"] or 0
             local upgradePrice = Upgrade[upgradeName.."price"]
-            local upgradeCount = Upgrade[upgradeName.."count"]  -- Required building count
-            local currentBuildingCount = Button[selectedBuilding.."count"]
-            
-            -- Only show upgrade if player has enough buildings to unlock it
-            if currentBuildingCount >= upgradeCount then
-                -- Draw upgrade frame based on status
-                if Texture["UpgradeFrame"] then
-                    local frameSliceX = 0
-                    
-                    if upgradeStatus == 2 then
-                        -- Already purchased - show special frame or darkened version
-                        frameSliceX = 120  -- Assuming there's a third frame for purchased upgrades
-                        -- If no third frame exists, use the affordable frame but we'll darken it
-                        if frameSliceX > Graphics.getImageWidth(Texture["UpgradeFrame"]) then
-                            frameSliceX = 0
-                        end
-                    elseif Cookie.count >= upgradePrice then
-                        frameSliceX = 0  -- Left slice = affordable
-                    else
-                        frameSliceX = 60  -- Right slice = unaffordable
-                    end
-                    
-                    Graphics.drawImageExtended(frameX + frameSize/2, upgradeY + frameSize/2, 
-                        frameSliceX, 0, 60, 60, 0, frameSize/60, frameSize/60, Texture["UpgradeFrame"])
-                    
-                    -- Darken purchased upgrades
-                    if upgradeStatus == 2 then
-                        Graphics.fillRect(frameX, frameX + frameSize, upgradeY, upgradeY + frameSize, Color.new(0, 0, 0, 128))
-                    end
-                    
-                    -- Draw upgrade icon from icons.png
-                    if Texture["Icons"] then
-                        local iconColumn = Upgrade[upgradeName.."column"] or 1
-                        local iconRow = Upgrade[upgradeName.."row"] or 1
-                        local iconX = (iconColumn - 1) * 48
-                        local iconY = (iconRow - 1) * 48
-                        local iconSize = math.floor(32 * scale)
-                        
-                        Graphics.drawImageExtended(frameX + frameSize/2, upgradeY + frameSize/2, 
-                            iconX, iconY, 48, 48, 0, iconSize/48, iconSize/48, Texture["Icons"])
-                        
-                        -- Show price for available upgrades (not purchased)
-                        if upgradeStatus ~= 2 then
-                            local priceText = formatNumber(upgradePrice)
-                            local priceColor = Cookie.count >= upgradePrice and green or red
-                            local textY = upgradeY + frameSize - math.floor(15 * scaleY)
-                            Font.print(smallFont, frameX + math.floor(2 * scaleX), textY, priceText, priceColor)
-                        end
-                    end
+            local upgradeCount = Upgrade[upgradeName.."count"]  -- buildings needed to unlock
+
+            if Button[selectedBuilding.."count"] >= upgradeCount then
+                local frameSliceX = 60  -- right slice = unaffordable
+                if upgradeStatus == 2 or Cookie.count >= upgradePrice then
+                    frameSliceX = 0
+                end
+                Graphics.drawImageExtended(frameX + frameSize/2, upgradeY + frameSize/2,
+                    frameSliceX, 0, 60, 60, 0, frameSize/60, frameSize/60, Texture["UpgradeFrame"])
+
+                if Texture["Icons"] then
+                    local iconX = ((Upgrade[upgradeName.."column"] or 1) - 1) * 48
+                    local iconY = ((Upgrade[upgradeName.."row"] or 1) - 1) * 48
+                    local iconSize = math.floor(32 * scale)
+                    Graphics.drawImageExtended(frameX + frameSize/2, upgradeY + frameSize/2,
+                        iconX, iconY, 48, 48, 0, iconSize/48, iconSize/48, Texture["Icons"])
+                end
+
+                if upgradeStatus == 2 then
+                    -- Bought: dim it
+                    Graphics.fillRect(frameX, frameX + frameSize, upgradeY, upgradeY + frameSize, Color.new(0, 0, 0, 140))
+                else
+                    local priceColor = Cookie.count >= upgradePrice and green or red
+                    Font.print(smallFont, frameX + math.floor(2 * scaleX), upgradeY + frameSize - math.floor(15 * scaleY), formatNumber(upgradePrice), priceColor)
+                end
+
+                -- The one Y buys
+                if upgradeName == nextUpgrade then
+                    drawFrame(frameX - 1, upgradeY - 1, frameSize + 2, frameSize + 2, 2, gold)
                 end
             else
-                -- Not unlocked yet - show empty frame or lock icon
-                if Texture["UpgradeFrame"] then
-                    -- Draw a darkened frame
-                    Graphics.drawImageExtended(frameX + frameSize/2, upgradeY + frameSize/2, 
-                        60, 0, 60, 60, 0, frameSize/60, frameSize/60, Texture["UpgradeFrame"])
-                    Graphics.fillRect(frameX, frameX + frameSize, upgradeY, upgradeY + frameSize, Color.new(0, 0, 0, 180))
-                    
-                    -- Show lock symbol or required count
-                    local lockText = tostring(upgradeCount)
-                    drawSmallText(frameX + frameSize/2 - 6, upgradeY + frameSize/2 - 6, lockText, white)
-                end
+                -- Locked: show how many buildings unlock it
+                Graphics.drawImageExtended(frameX + frameSize/2, upgradeY + frameSize/2,
+                    60, 0, 60, 60, 0, frameSize/60, frameSize/60, Texture["UpgradeFrame"])
+                Graphics.fillRect(frameX, frameX + frameSize, upgradeY, upgradeY + frameSize, Color.new(0, 0, 0, 180))
+                local lockText = tostring(upgradeCount)
+                drawSmallText(frameX + (frameSize - textWidth(smallFont, lockText)) / 2, upgradeY + frameSize/2 - 8, lockText, white)
             end
         end
     end
@@ -2028,139 +2040,106 @@ end
 
 -- Title Screen drawing
 function drawTitleScreen()
-    -- Draw background if available
     if Texture["Background"] then
         Graphics.drawImageExtended(screenW/2, screenH/2, 0, 0, 960, 544, 0, scaleX, scaleY, Texture["Background"])
     end
-    
-    
-    -- Draw "Cookie Clicker" title
-    local titleY = math.floor(40 * scaleY)
-    local titleText = "COOKIE CLICKER"
-    local titleX = screenW/2 - 140  -- Adjusted for larger font
-    drawTitleText(titleX, titleY, titleText, white)
-    
-    -- Draw version in bottom right corner
-    drawSmallText(screenW - 80, screenH - 25, version, white)
-    
-    -- Draw cookie image
+
+    drawCentered(titleFont, math.floor(40 * scaleY), "COOKIE CLICKER", white)
+
+    -- Cookie
+    local cookieY = screenH/2 - math.floor(70 * scaleY)
     if Texture["Cookie"] then
-        local cookieScale = 0.6  -- Smaller cookie size
-        local cookieX = screenW/2
-        local cookieY = screenH/2 - math.floor(50 * scaleY)  -- Center it better, move up slightly
-        
-        -- Get actual image dimensions
+        local cookieScale = 0.55 * scale
         local cookieW = Graphics.getImageWidth(Texture["Cookie"]) or 128
         local cookieH = Graphics.getImageHeight(Texture["Cookie"]) or 128
-        
-        -- Draw shine effect behind cookie
         if Texture["Shine"] then
             local shineW = Graphics.getImageWidth(Texture["Shine"]) or 128
             local shineH = Graphics.getImageHeight(Texture["Shine"]) or 128
             local shineScale = cookieScale * 0.8
-            Graphics.drawImageExtended(cookieX, cookieY, 0, 0, shineW, shineH, Shine.rot, shineScale, shineScale, Texture["Shine"])
-            Graphics.drawImageExtended(cookieX, cookieY, 0, 0, shineW, shineH, -Shine.rot, shineScale, shineScale, Texture["Shine"])
+            Graphics.drawImageExtended(screenW/2, cookieY, 0, 0, shineW, shineH, Shine.rot, shineScale, shineScale, Texture["Shine"])
+            Graphics.drawImageExtended(screenW/2, cookieY, 0, 0, shineW, shineH, -Shine.rot, shineScale, shineScale, Texture["Shine"])
         end
-        
-        Graphics.drawImageExtended(cookieX, cookieY, 0, 0, cookieW, cookieH, 0, cookieScale, cookieScale, Texture["Cookie"])
+        Graphics.drawImageExtended(screenW/2, cookieY, 0, 0, cookieW, cookieH, 0, cookieScale, cookieScale, Texture["Cookie"])
     end
-    
-    -- Draw menu options
-    local menuStartY = screenH/2 + math.floor(80 * scaleY)  -- Position below the cookie
-    local menuSpacing = math.floor(25 * scaleY)  -- Reduced spacing between menu items
-    
-    for i = 1, MenuState.optionCount do
-        local option = MenuState.options[i]
-        local y = menuStartY + (i - 1) * menuSpacing
-        local darkGray = Color.new(50, 50, 50)
-        local color = darkGray
-        
-        -- Calculate text width (approximate based on character count)
-        local textWidth = string.len(option) * 8  -- Approximate character width
-        local textX = screenW/2 - textWidth/2
-        
-        -- Highlight selected option
-        if i == MenuState.selectedIndex then
-            color = white
-            -- Draw selection indicator centered to the left of text
-            drawText(textX - 25, y, ">", white)
-        end
-        
-        drawText(textX, y, option, color)
-    end
-    
+
+    -- Menu
+    local spacing = math.floor(26 * scaleY)
+    local menuTop = screenH/2 + math.floor(55 * scaleY)
+    drawMenuList(MenuState, menuTop, spacing)
+
+    drawSmallText(screenW - textWidth(smallFont, version) - 10, screenH - math.floor(22 * scaleY), version, grey)
+    drawHints({{"A", "Select"}, {"Esc", "Quit"}})
 end
 
 -- Controls Screen drawing
 function drawControlsScreen()
-    -- Draw background
     if Texture["Background"] then
         Graphics.drawImageExtended(screenW/2, screenH/2, 0, 0, 960, 544, 0, scaleX, scaleY, Texture["Background"])
     end
-    
-    -- Draw title
-    drawText(screenW/2 - 50, math.floor(30 * scaleY), "CONTROLS", white)
-    
-    -- Draw controls list
-    local startY = math.floor(70 * scaleY)
-    local lineHeight = math.floor(22 * scaleY)
-    local currentY = startY
-    
-    -- Combined controls showing keyboard/gamepad for each action
-    local controls = {
-        {"ENTER/A Button", "Enter/Action"},
-        {"X/X Button", "Click Cookie"},
-        {"TAB/B Button", "Switch Panel (Buildings/Store)"},
-        {"UP/DOWN/D-Pad UP/DOWN", "Navigate Items"},
-        {"LEFT/RIGHT/D-Pad LEFT/RIGHT", "Navigate Horizontally"},
-        {"ENTER/A Button", "Confirm/Purchase"},
-        {"T/L Button", "Toggle Buy/Sell Mode"},
-        {"R/R Button", "Change Quantity (1/10/100)"},
-        {"Y/Y Button", "Buy Upgrade"},
-        {"BACKSPACE/Start", "Return to Menu"},
-        {"ESC", "Exit Game"}
+
+    drawCentered(defaultFont, math.floor(30 * scaleY), "CONTROLS", white)
+
+    local rows = {
+        {"Click the cookie",  "B",               "X"},
+        {"Move in the store", "D-pad up/down",   "Up/Down"},
+        {"Buy amount",        "D-pad left/right", "Left/Right"},
+        {"Buy / sell",        "A (hold to repeat)", "Enter"},
+        {"Buy upgrade",       "Y",               "Y"},
+        {"Buy / sell mode",   "L or R",          "T"},
+        {"Menu (saves)",      "Start",           "Backspace"},
+        {"Back",              "B",               "Backspace"},
+        {"Quit",              "Select + Start",  "Esc"},
     }
-    
-    for i, control in ipairs(controls) do
-        local keys = control[1]
-        local description = control[2]
-        
-        drawText(math.floor(50 * scaleX), currentY, keys, white)
-        drawText(math.floor(320 * scaleX), currentY, description, white)
-        currentY = currentY + lineHeight
+
+    local colX = {math.floor(screenW * 0.06), math.floor(screenW * 0.38), math.floor(screenW * 0.74)}
+    local y = math.floor(70 * scaleY)
+    local lineHeight = math.floor(30 * scaleY)
+
+    drawText(colX[1], y, "Action", grey)
+    drawText(colX[2], y, "Gamepad", grey)
+    drawText(colX[3], y, "Keyboard", grey)
+    y = y + lineHeight
+    for _, row in ipairs(rows) do
+        drawText(colX[1], y, row[1], white)
+        drawText(colX[2], y, row[2], gold)
+        drawText(colX[3], y, row[3], white)
+        y = y + lineHeight
     end
-    
+
+    drawHints({{"B", "Back"}})
 end
 
 -- Settings Screen drawing
 function drawSettingsScreen()
-    -- Draw background
     if Texture["Background"] then
         Graphics.drawImageExtended(screenW/2, screenH/2, 0, 0, 960, 544, 0, scaleX, scaleY, Texture["Background"])
     end
-    
-    -- Draw title
-    drawText(screenW/2 - 50, math.floor(30 * scaleY), "SETTINGS", white)
-    
-    -- Settings menu with navigation
-    local startY = math.floor(120 * scaleY)
+
+    drawCentered(defaultFont, math.floor(30 * scaleY), "SETTINGS", white)
+
+    local top = math.floor(90 * scaleY)
     local lineHeight = math.floor(40 * scaleY)
-    local darkGray = Color.new(50, 50, 50)
-    
+    local barLeft = math.floor(screenW * 0.15)
+    local barRight = math.floor(screenW * 0.85)
+
     for i = 1, SettingsState.optionCount do
         local option = SettingsState.options[i]
-        local y = startY + (i - 1) * lineHeight
-        local color = darkGray
-        local valueText = ""
-        local valueColor = white
-        
-        -- Get option values
+        local y = top + (i - 1) * lineHeight
+        local selected = i == SettingsState.selectedIndex
+        local valueText, valueColor = "", white
+
         if option == "Background Music" then
             valueText = AudioSettings.bgMusicEnabled and "ON" or "OFF"
             valueColor = AudioSettings.bgMusicEnabled and green or red
         elseif option == "Music Volume" then
-            valueText = math.floor(AudioSettings.bgMusicVolume * 100) .. "%"
-            valueColor = white
+            valueText = math.floor(AudioSettings.bgMusicVolume * 100 + 0.5) .. "%"
+            if selected then valueText = "< " .. valueText .. " >" end
+        elseif option == "Sound Effects" then
+            valueText = AudioSettings.sfxEnabled and "ON" or "OFF"
+            valueColor = AudioSettings.sfxEnabled and green or red
+        elseif option == "Effects Volume" then
+            valueText = math.floor(AudioSettings.sfxVolume * 100 + 0.5) .. "%"
+            if selected then valueText = "< " .. valueText .. " >" end
         elseif option == "Cookie Shower" then
             valueText = VisualSettings.cookieShowerEnabled and "ON" or "OFF"
             valueColor = VisualSettings.cookieShowerEnabled and green or red
@@ -2168,21 +2147,23 @@ function drawSettingsScreen()
             valueText = VisualSettings.milkAnimationEnabled and "ON" or "OFF"
             valueColor = VisualSettings.milkAnimationEnabled and green or red
         elseif option == "Reset Game" then
-            valueText = "PRESS ENTER"
+            valueText = SettingsState.confirmReset and "Press A again to erase" or ""
             valueColor = red
         end
-        
-        -- Highlight selected option
-        if i == SettingsState.selectedIndex then
-            color = white
-            -- Draw selection indicator
-            drawText(math.floor(50 * scaleX), y, ">", white)
+
+        if selected then
+            Graphics.fillRect(barLeft, barRight, y - math.floor(8 * scaleY), y + math.floor(26 * scaleY), selectBar)
         end
-        
-        -- Draw option name and value
-        drawText(math.floor(80 * scaleX), y, option .. ": " .. valueText, color)
+        drawText(barLeft + math.floor(16 * scaleX), y, option, selected and white or menuIdle)
+        drawText(barRight - math.floor(16 * scaleX) - textWidth(defaultFont, valueText), y, valueText, valueColor)
     end
-    
+
+    local selectedOption = SettingsState.options[SettingsState.selectedIndex]
+    if selectedOption == "Music Volume" or selectedOption == "Effects Volume" then
+        drawHints({{"Left/Right", "Adjust"}, {"B", "Back"}})
+    else
+        drawHints({{"A", "Select"}, {"B", "Back"}})
+    end
 end
 
 -- Statistics Screen drawing
@@ -2193,7 +2174,7 @@ function drawStatisticsScreen()
     end
     
     -- Draw title
-    drawText(screenW/2 - 60, math.floor(30 * scaleY), "STATISTICS", white)
+    drawCentered(defaultFont, math.floor(30 * scaleY), "STATISTICS", white)
     
     -- Calculate play time
     local currentTime = Timer.getTime(timer)
@@ -2277,6 +2258,7 @@ function drawStatisticsScreen()
         currentY = currentY + lineHeight
     end
     
+    drawHints({{"B", "Back"}})
 end
 
 -- About Screen drawing
@@ -2293,7 +2275,7 @@ function drawAboutScreen()
     
     -- Draw cookie image (smaller)
     if Texture["Cookie"] then
-        local cookieScale = 0.3
+        local cookieScale = 0.3 * scale
         local cookieX = screenW/2
         local cookieY = math.floor(120 * scaleY)
         
@@ -2352,10 +2334,7 @@ function drawAboutScreen()
         Graphics.drawImageExtended(logoX, logoY, 0, 0, logoW, logoH, 0, logoScale, logoScale, Texture["LppSDL"])
     end
     
-    -- Draw instructions (centered)
-    local instructions = "ENTER or BACKSPACE: Return to Menu"
-    local instructionsWidth = string.len(instructions) * 8
-    drawText(screenW/2 - instructionsWidth/2, screenH - math.floor(20 * scaleY), instructions, white)
+    drawHints({{"B", "Back"}})
 end
 
 function drawUI()
@@ -2407,6 +2386,7 @@ Timer.resume(timer)
 Timer.resume(navTimer)
 Timer.resume(buttonTimer)
 Timer.resume(cookieTimer)
+Timer.resume(autosaveTimer)
 
 -- Initialize upgrade quantities for all buildings
 Upgrade["CursorQuan"] = 1
@@ -2468,6 +2448,7 @@ end
 
 -- Try to load saved game
 loadGame()
+updateSfxVolume()
 
 -- Start background music for all screens if enabled
 if AudioSettings.bgMusicEnabled then
@@ -2539,6 +2520,13 @@ while true do
         
         Timer.reset(timer)
     end
+
+    -- Autosave, so quitting with the system hotkey keeps recent progress
+    if gameState == "Game" and Timer.getTime(autosaveTimer) >= AUTOSAVE_DELAY then
+        saveGame()
+        Timer.reset(autosaveTimer)
+    end
+    flushPendingSave()
     
     -- Render
     Graphics.initBlend()
@@ -2575,8 +2563,9 @@ while true do
         drawBuildingsBackground()
         drawBuildings()
         drawCookie()
-        drawUpgrades()
         drawStore()
+        drawStoreMask()
+        drawUpgrades()
         drawUI()
     elseif gameState == "Controls" then
         drawControlsScreen()
